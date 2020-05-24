@@ -1,0 +1,5 @@
+HTTP/1.0 404 Bad Request
+Content-length: 103
+Server: ResNova_NovaServer_Mac/4.0
+Pragma: no-cache
+

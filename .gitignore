@@ -1,0 +1,7 @@
+private
+NovaTerm/lib/impl
+NovaTerm/native/internal_tmp
+NovaTerm/build
+NovaTerm/dist
+NovaTerm/css/.backups
+NovaserverProxy/target
