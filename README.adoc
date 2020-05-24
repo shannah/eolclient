@@ -1,0 +1,6 @@
+== EOLClient
+
+A modern client for the abandoned (but awesome) NovaServer 4.0 BBS
+
+
+
