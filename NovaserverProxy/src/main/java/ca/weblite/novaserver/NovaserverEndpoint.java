@@ -23,7 +23,7 @@ import javax.websocket.server.ServerEndpoint;
 @ServerEndpoint("/nova")
 public class NovaserverEndpoint {
 
-    private String novaserverHost = "10.0.1.110";
+    private String novaserverHost = "10.0.1.117";
     private int novaserverPort = 194;
     
     private static Map<Session,SocketWrapper> sessions = Collections.synchronizedMap(new HashMap<Session,SocketWrapper>());

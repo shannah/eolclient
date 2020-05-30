@@ -34,7 +34,7 @@ import javax.servlet.http.Part;
  */
 public class NovaserverHTTPProxy extends HttpServlet {
 
-    private String novaserverHost = "10.0.1.110";
+    private String novaserverHost = "10.0.1.117";
     private int novaserverPort = 80;
 
     private static Map<String, String> parseHTTPHeaders(InputStream inputStream)
