@@ -7,6 +7,7 @@ package ca.weblite.novaterm.controllers;
 
 
 
+import ca.weblite.novaterm.events.RefreshEvent;
 import ca.weblite.novaterm.models.MessageForumModel;
 import ca.weblite.novaterm.models.MessageModel;
 import ca.weblite.novaterm.schemas.FileLibrary;
@@ -18,11 +19,13 @@ import ca.weblite.novaterm.views.MessageForumRowView;
 import ca.weblite.novaterm.views.MessageForumView;
 import com.codename1.processing.Result;
 import com.codename1.rad.controllers.Controller;
+import com.codename1.rad.controllers.ControllerEvent;
 import com.codename1.rad.models.Entity;
 import com.codename1.rad.models.EntityList;
 import com.codename1.rad.nodes.ActionNode;
 import com.codename1.rad.nodes.ViewNode;
 import com.codename1.rad.ui.UI;
+import com.codename1.ui.FontImage;
 import com.codename1.ui.Label;
 import com.codename1.xml.Element;
 import java.util.List;
@@ -34,6 +37,10 @@ import java.util.List;
 public class MessageForumController extends NTBaseFormController {
     private MessageForumModel model;
     public static final ActionNode viewMessage = new ActionNode(UI.label("View Message"));
+    public static final ActionNode postMessage = UI.action(
+            UI.label("Post Message"),
+            UI.icon(FontImage.MATERIAL_POST_ADD)
+    );
     
     public MessageForumController(Controller parent, String url) {
         super(parent, url);
@@ -53,6 +60,10 @@ public class MessageForumController extends NTBaseFormController {
                 new MessageFormController(this, (MessageModel)messageModel).show();
             }
         });
+        addActionListener(postMessage, evt->{
+            evt.consume();
+            new PostMessageController(this, model).show();
+        });
     }
 
     @Override
@@ -65,6 +76,7 @@ public class MessageForumController extends NTBaseFormController {
     private MessageModel createMessageModel(Element a) {
         MessageModel out = new MessageModel();
         out.set(Message.url, getForumURL() +a.getAttribute("href"));
+        out.set(Message.forum, model);
         List<Element> children = (List<Element>)a.getChildrenByTagName("ni");
         String type = getText(children.get(0));
         out.setText(Message.subject, getText(children.get(1)));
@@ -101,7 +113,10 @@ public class MessageForumController extends NTBaseFormController {
     @Override
     protected ViewNode createViewNode() {
         ViewNode out = super.createViewNode();
-        out.setAttributes(UI.actions(MessageForumRowView.MESSAGE_CLICKED, viewMessage));
+        out.setAttributes(
+                UI.actions(MessageForumRowView.MESSAGE_CLICKED, viewMessage),
+                UI.actions(MessageForumView.FORUM_ACTIONS, postMessage)
+        );
         return out;
     }
     
@@ -116,6 +131,18 @@ public class MessageForumController extends NTBaseFormController {
         }
         return out;
         
+    }
+    
+    @Override
+    public void actionPerformed(ControllerEvent evt) {
+        if (evt instanceof RefreshEvent) {
+            // A refresh event occurred.  We should refresh the form.
+            evt.consume();
+            new MessageForumController(getParent(), getURL()).showBack();
+            return;
+            
+        }
+        super.actionPerformed(evt);
     }
     
 }

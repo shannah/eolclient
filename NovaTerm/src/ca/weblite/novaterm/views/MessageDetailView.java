@@ -20,6 +20,7 @@ import com.codename1.rad.propertyviews.SpanLabelPropertyView;
 import com.codename1.rad.schemas.ListRowItem;
 import com.codename1.rad.schemas.Thing;
 import com.codename1.rad.ui.AbstractEntityView;
+import com.codename1.rad.ui.Actions;
 import com.codename1.rad.ui.UIBuilder;
 import com.codename1.ui.Button;
 import static com.codename1.ui.CN.EAST;
@@ -30,6 +31,7 @@ import com.codename1.ui.FontImage;
 import com.codename1.ui.Label;
 import com.codename1.ui.layouts.BorderLayout;
 import com.codename1.ui.layouts.BoxLayout;
+import com.codename1.ui.layouts.GridLayout;
 
 /**
  *
@@ -41,6 +43,8 @@ public class MessageDetailView extends AbstractEntityView {
             PREV_MESSAGE = new Category(),
             NEXT_THREAD = new Category(),
             PREV_THREAD = new Category();
+    
+    public static final Category MESSAGE_ACTIONS = new Category();
     
     private ViewNode node;
     private LabelPropertyView subjectLabel, dateLabel, authorLabel;
@@ -68,6 +72,14 @@ public class MessageDetailView extends AbstractEntityView {
         
         north.add(CENTER, BoxLayout.encloseY(subjectLabel, authorLabel));
         
+        
+        Actions messageActions = node.getInheritedActions(MESSAGE_ACTIONS);
+        if (!messageActions.isEmpty()) {
+            Container actionsPanel = new Container(new GridLayout(messageActions.size()));
+            messageActions.addToContainer(actionsPanel, entity);
+            north.add(EAST, actionsPanel);
+        }
+        
         ActionNode nextMessageAction = node.getInheritedAction(NEXT_MESSAGE);
         ActionNode prevMessageAction = node.getInheritedAction(PREV_MESSAGE);
         ActionNode nextThreadAction = node.getInheritedAction(NEXT_THREAD);
@@ -89,6 +101,10 @@ public class MessageDetailView extends AbstractEntityView {
             navBar.add(nextMessageAction.createView(entity));
         }
         add(NORTH, BoxLayout.encloseY(north, navBar));
+        
+        
+        
+        
         add(CENTER, bodyLabel);
         
         

@@ -478,9 +478,10 @@ public class NovaServerSession extends Entity {
         } catch (Throwable e) {
             Log.e(e);
         }
-        req.addArgument("Description", description);
+        
+        
         try {
-            
+            req.addData("Description", description.getBytes("x-MacRoman"), "text/plain");
             req.addData("File", filePath, Util.guessMimeType(filePath));
             req.setFilename("File", fileName);
         } catch (IOException ex) {
@@ -496,6 +497,63 @@ public class NovaServerSession extends Entity {
         NetworkManager.getInstance().addToQueue(req);
         return out;
     }
+    
+    public HTTPFileUploadResponse httpPostMessage(String url, String to, String subject, String body, String attachment) {
+        //url = StringUtil.replaceAll(url, " ", "%20");
+        if (!url.startsWith("http:")) {
+            url = "http://*"+url;
+        }
+        
+        String fileName = attachment == null ? null : new File(attachment).getName();
+        //fileName = "cindy-richard.jpg";
+        HTTPFileUploadResponse out = new HTTPFileUploadResponse();
+        MultipartRequest req = new MultipartRequest();
+        req.setHttpMethod("POST");
+        req.setPost(true);
+        //req.setBase64Binaries(false);
+        req.setUrl(this.httpURL + "?uri="+Util.encodeUrl(url));
+        req.addRequestHeader("Authorization", createHttpDigestAuthHeader(url, getText(username), getText(password), "POST", false));
+        req.addRequestHeader("X-NT-To", to);
+        req.addRequestHeader("X-NT-Subject", subject);
+        if (fileName != null) {
+            req.addRequestHeader("X-NT-Attached", fileName);
+            req.addRequestHeader("X-NS-FileSize", ""+new File(attachment).length());
+            req.addRequestHeader("X-NS-LastModified", ""+new File(attachment).lastModified());
+            try {
+                req.addRequestHeader("X-NS-Mimetype", Util.guessMimeType(attachment));
+
+            } catch (Throwable e) {
+                Log.e(e);
+            }
+        }
+        //req.addArgument("Description", body);
+        try {
+            req.addData("Description", body.getBytes("x-MacRoman"), "text/plain");
+            
+        } catch (IOException ex) {
+            out.error(ex);
+            return out;
+        }
+        if (fileName != null) {
+            try {
+                
+                req.addData("File", attachment, Util.guessMimeType(attachment));
+                req.setFilename("File", fileName);
+            } catch (IOException ex) {
+                out.error(ex);
+                return out;
+            }
+        }
+        req.addResponseCodeListener(evt->{
+            out.error(new IOException("Request failed: "+req.getResponseCode()));
+        });
+        req.addResponseListener(evt->{
+            out.complete(req.getResponseCode() == 200);
+        });
+        NetworkManager.getInstance().addToQueue(req);
+        return out;
+    }
+    
     
     public HTTPStringResponse httpGetString(String url) {
         url = StringUtil.replaceAll(url, " ", "%20");

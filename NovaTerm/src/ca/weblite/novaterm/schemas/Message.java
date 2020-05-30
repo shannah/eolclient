@@ -30,8 +30,9 @@ public interface Message {
             nextMessageUrl = new Tag("nextMessage"),
             prevMessageUrl = new Tag("prevMessage"),
     
-            messages = MessageForum.messages;
+            messages = MessageForum.messages,
+            forum = new Tag("forum");
     
-    public static final Tag[] ALL_TAGS = new Tag[]{subject, author, attachment, datePosted, numMessages, url, read, body, attentionTo, messages, nextThreadUrl, prevThreadUrl, nextMessageUrl, prevMessageUrl};
+    public static final Tag[] ALL_TAGS = new Tag[]{subject, author, attachment, datePosted, numMessages, url, read, body, attentionTo, messages, nextThreadUrl, prevThreadUrl, nextMessageUrl, prevMessageUrl, messages, forum};
             
 }

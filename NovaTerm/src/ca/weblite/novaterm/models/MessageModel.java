@@ -28,6 +28,7 @@ public class MessageModel extends Entity {
         string(Message.prevMessageUrl);
         string(Message.nextThreadUrl);
         string(Message.prevThreadUrl);
+        entity(MessageForumModel.class, Message.forum);
         
         
     }};

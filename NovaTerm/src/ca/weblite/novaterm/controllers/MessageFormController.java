@@ -37,6 +37,12 @@ import com.codename1.xml.Element;
 public class MessageFormController extends NTBaseFormController {
     private MessageModel model;
     
+    public static final ActionNode reply = new ActionNode(
+            label("Reply"),
+            UI.icon(FontImage.MATERIAL_REPLY)
+            
+    );
+    
     public static final ActionNode nextMessage = new ActionNode(
             label("Next Message"), UI.icon(FontImage.MATERIAL_ARROW_RIGHT),
             UI.enabledCondition(entity->{
@@ -104,6 +110,11 @@ public class MessageFormController extends NTBaseFormController {
             } else {
                 new MessageFormController(getParent(), prevModel).show();
             }
+        });
+        
+        addActionListener(reply, evt->{
+            evt.consume();
+            new PostMessageController(parent, (MessageForumModel)model.getEntity(Message.forum), model).show();
         });
     }
 
@@ -208,7 +219,8 @@ Content-Transfer-Encoding: binary
                 UI.actions(MessageDetailView.NEXT_MESSAGE, nextMessage),
                 UI.actions(MessageDetailView.PREV_MESSAGE, prevMessage),
                 UI.actions(MessageDetailView.NEXT_THREAD, nextThread),
-                UI.actions(MessageDetailView.PREV_THREAD, prevThread)
+                UI.actions(MessageDetailView.PREV_THREAD, prevThread),
+                UI.actions(MessageDetailView.MESSAGE_ACTIONS, reply)
         );
         return out;
     }
