@@ -1,0 +1,1202 @@
+= EOLClient Developer Guide
+:author: Steve Hannah
+:revdate: 2026-04-15
+:toc: left
+:toclevels: 3
+:icons: font
+:source-highlighter: rouge
+:sectnums:
+
+== Project Overview
+
+EOLClient is a modern mobile client for the abandoned (but still functional) *NovaServer 4.0* BBS system.
+NovaServer was a classic Macintosh bulletin board server created by ResNova Software in the mid-1990s.
+The original NovaTerm client only runs on classic Mac OS, making the BBS inaccessible from modern devices.
+
+This project bridges that gap with two components:
+
+* **NovaTerm** -- A cross-platform mobile client built with https://www.codenameone.com/[Codename One], targeting iOS, Android, and Desktop (JavaSE).
+* **NovaserverProxy** -- A Java servlet-based reverse proxy that translates between modern WebSocket/HTTP and NovaServer's legacy protocols.
+
+A third subproject, **NovatermIRCClient**, exists as an early standalone IRC client prototype but is largely unimplemented.
+
+=== Key Dependencies
+
+[cols="1,2"]
+|===
+|Component |Dependencies
+
+|NovaTerm
+|Codename One RAD Framework, BouncyCastle (MD5 digest), SocketRocket (iOS WebSocket)
+
+|NovaserverProxy
+|Java EE 7 Web API, javax.websocket 1.0, Apache Tomcat 7 (embedded)
+|===
+
+
+[[architecture]]
+== High-Level Architecture
+
+The system uses a three-tier architecture with two parallel communication channels passing through the proxy.
+
+[ditaa]
+----
+                        NovaserverProxy
+  NovaTerm Client       (Java Servlet WAR)        NovaServer 4.0 BBS
+ +------------------+  +---------------------+  +--------------------+
+ |                  |  |                     |  |                    |
+ | Codename One App |  | Tomcat on port 8080 |  | Legacy BBS Server  |
+ |                  |  |                     |  |                    |
+ | +------+         |  | +-------+  +------+ |  |  +---------+      |
+ | |WebSkt|---------|->| | /nova |->|Socket|-|->|  | Port 194|      |
+ | |Client|<--------|--| |  {io} |<-|Wrap  | |<-|  | IRC-like|      |
+ | +------+         |  | +-------+  +------+ |  |  +---------+      |
+ |                  |  |                     |  |                    |
+ | +------+         |  | +-------+  +------+ |  |  +---------+      |
+ | | HTTP |---------|->| |/proxy |->| TCP  |-|->|  | Port 80 |      |
+ | |Client|<--------|--| |  {io} |<-|Socket| |<-|  | HTTP    |      |
+ | +------+         |  | +-------+  +------+ |  |  +---------+      |
+ |                  |  |                     |  |                    |
+ +------------------+  +---------------------+  +--------------------+
+----
+
+*Why two channels?*
+
+* The *WebSocket channel* (proxied to port 194) carries an IRC-like line protocol used for authentication, session management, and server-push navigation commands. This channel stays open for the duration of the session.
+* The *HTTP channel* (proxied to port 80) carries content requests (designs, forums, files), file uploads, and message posting. Each request opens a new TCP socket to the BBS.
+
+
+[[repository-structure]]
+== Repository Structure
+
+[source]
+----
+eolclient/
+├── NovaTerm/                          # Codename One mobile client
+│   ├── build.xml                      # Ant build file
+│   ├── codenameone_settings.properties
+│   ├── lib/                           # CN1 JARs and .cn1lib files
+│   └── src/ca/weblite/novaterm/
+│       ├── NovaTerm.java              # ApplicationController entry point
+│       ├── controllers/               # 12 MVC controllers
+│       ├── views/                     # 12 UI view classes
+│       ├── models/                    # 9 data model classes
+│       ├── schemas/                   # 8 entity tag/schema interfaces
+│       ├── services/                  # NovaServerSession (network layer)
+│       ├── events/                    # NavigationEvent, RefreshEvent, HoverEvent
+│       └── util/                      # TypeUtil, XMLUtil, Regex
+│
+├── NovaserverProxy/                   # Reverse proxy server (Maven)
+│   ├── pom.xml                        # Maven build (WAR + embedded Tomcat)
+│   └── src/main/
+│       ├── java/ca/weblite/
+│       │   ├── novaserver/
+│       │   │   ├── NovaserverHTTPProxy.java   # HTTP proxy servlet
+│       │   │   ├── NovaserverEndpoint.java    # WebSocket endpoint
+│       │   │   └── MacbinaryEncoder.java      # MacBinary II file encoder
+│       │   └── novaterm/
+│       │       ├── SocketWrapper.java         # WebSocket-to-TCP bridge
+│       │       └── NTSession.java             # IRC protocol + digest auth
+│       └── webapp/WEB-INF/web.xml
+│
+├── NovatermIRCClient/                 # Standalone IRC client (stub)
+├── novaterm.php                       # PHP prototype (reverse-engineering tool)
+├── templates/                         # PHP templates from prototype
+├── test4.pcapng                       # Network capture for protocol analysis
+└── README.adoc
+----
+
+NOTE: The `novaterm.php` file and `test4.pcapng` packet capture are artifacts from the protocol reverse-engineering process. The PHP file contains a working prototype that was used to understand the NovaServer protocol before the Java implementation was built.
+
+
+[[communication]]
+== Communication Architecture
+
+[[websocket-channel]]
+=== WebSocket Channel (IRC-like Protocol)
+
+The WebSocket channel provides real-time, bidirectional communication for session management and server-push events.
+
+==== Proxy Components
+
+* `NovaserverEndpoint` (`@ServerEndpoint("/nova")`) -- Accepts WebSocket connections from the client.
+* `SocketWrapper` -- Bridges each WebSocket session to a raw TCP socket connected to NovaServer port 194. One background thread per connection reads lines from the TCP socket and relays them to the WebSocket.
+
+==== Protocol Format
+
+Messages are line-based, terminated by `\r\n`. The protocol uses IRC-style commands:
+
+[cols="1,3"]
+|===
+|Command |Description
+
+|`NONC :user="USERNAME"`
+|Client requests a nonce for digest authentication
+
+|`AUTH :digest username="...",realm="...",nonce="...",uri="...",response="..."`
+|Client sends digest authentication response
+
+|`JOIN ServerMessages`
+|Client joins the server messages channel after login
+
+|`REQUEST /path/to/resource`
+|Server pushes a navigation command to the client
+|===
+
+[cols="1,3"]
+|===
+|Response Code |Meaning
+
+|`300 :digest realm="..." nonce="..."`
+|Server challenge with nonce and realm
+
+|`300`
+|Authentication success
+
+|`464`
+|User already connected from another client
+|===
+
+==== Message Queue
+
+`SocketWrapper` maintains a `LinkedList<String>` message queue. If the TCP socket is not yet established when a WebSocket message arrives, the message is queued and flushed once the socket connects.
+
+[[http-channel]]
+=== HTTP Channel
+
+The HTTP channel handles content retrieval, file uploads, and message posting.
+
+==== Proxy Component
+
+`NovaserverHTTPProxy` -- An `HttpServlet` mapped to `/proxy` that:
+
+1. Receives requests from the client with a `uri` query parameter
+2. Opens a raw TCP socket to NovaServer port 80
+3. Translates the request into NovaServer's HTTP/V1.0 dialect
+4. Streams the response back to the client
+
+==== Request Translation
+
+The proxy rewrites client requests into NovaServer format:
+
+[source]
+----
+GET <uri> HTTP/V1.0
+Authorization: <digest auth header>
+Connection: maintain
+User-Agent: ResNova_NovaTerm_Mac/4.0
+
+----
+
+For POST requests (file uploads), the proxy:
+
+* Converts HTML multipart/form-data into NovaServer's `multipart/mixed` format
+* Wraps uploaded files in MacBinary II encoding (see <<macbinary>>)
+* Includes custom headers: `X-NT-Name`, `X-NT-Subject`, `X-NT-Attached`, `X-NS-FileSize`, `X-NS-LastModified`, `X-NS-Mimetype`
+
+==== Response Handling
+
+NovaServer returns `multipart/mixed` responses with custom boundary delimiters. The proxy:
+
+* Parses the multipart boundary from the `Content-Type` header
+* For file downloads (when `Content-Type` parameter is set), strips the multipart wrapper and returns only the attachment body
+* Sets `Content-Disposition` headers for file downloads
+* Replaces `Connection: maintain` with `Connection: close`
+
+==== Dual-Channel Data Flow
+
+[ditaa]
+----
+  WebSocket Channel                    HTTP Channel
+ +------------------------+          +---------------------------+
+ |                        |          |                           |
+ | Authentication         |          | Design screen HTML        |
+ |   NONC, AUTH, 300, 464 |          |   GET /Design/17          |
+ |                        |          |                           |
+ | Session Management     |          | Message forum content     |
+ |   JOIN ServerMessages  |          |   GET /news/General/      |
+ |                        |          |                           |
+ | Server Push            |          | File library content      |
+ |   REQUEST /welcome.html|          |   GET /library/Software/  |
+ |   REQUEST /Design/17   |          |                           |
+ |                        |          | File uploads              |
+ | Real-time events       |          |   POST multipart/mixed    |
+ |   (future: chat)       |          |                           |
+ |                        |          | Message posting            |
+ +------------------------+          |   POST with Description   |
+                                     |                           |
+                                     | Image downloads           |
+                                     |   GET /file/image.gif     |
+                                     +---------------------------+
+----
+
+==== Authorization Session Caching
+
+The HTTP proxy caches the `Authorization` header in the servlet HTTP session (30-minute timeout). This allows the digest auth header to be passed once and reused across subsequent requests via cookies.
+
+
+[[authentication]]
+== Authentication
+
+Both channels use the same MD5-based digest authentication scheme, derived from HTTP Digest Auth (RFC 2617).
+
+=== Authentication Sequence
+
+[ditaa]
+----
+  Client                  Proxy                    NovaServer
+    |                       |                          |
+    |  1. WebSocket Open    |                          |
+    |---------------------->|   TCP Connect :194       |
+    |                       |------------------------->|
+    |                       |                          |
+    |  2. NONC :user="X"   |   NONC :user="X"        |
+    |---------------------->|------------------------->|
+    |                       |                          |
+    |                       |   300 :digest            |
+    |  3. 300 :digest       |   realm="R" nonce="N"   |
+    |   realm="R" nonce="N" |<-------------------------|
+    |<----------------------|                          |
+    |                       |                          |
+    |  4. AUTH :digest      |   AUTH :digest           |
+    |   response="HASH"    |   response="HASH"       |
+    |---------------------->|------------------------->|
+    |                       |                          |
+    |  5. 300 (success)     |   300                    |
+    |<----------------------|<-------------------------|
+    |                       |                          |
+    |  6. JOIN ServerMsgs   |   JOIN ServerMsgs       |
+    |---------------------->|------------------------->|
+    |                       |                          |
+    |  7. REQUEST           |   REQUEST                |
+    |   /welcome.html       |   /welcome.html         |
+    |<----------------------|<-------------------------|
+    |                       |                          |
+----
+
+=== Digest Computation
+
+The digest response is computed using three MD5 hashes:
+
+[source,java]
+----
+// From NovaServerSession.java, line 369
+HA1 = MD5(username + ":" + realm + ":" + password)
+HA2 = MD5(method + ":" + uri)
+response = MD5(HA1 + ":" + nonce + ":" + HA2)
+----
+
+Where:
+
+* `method` = `"irc"` for the WebSocket channel, `"GET"` or `"POST"` for HTTP
+* `uri` = `"/"` for IRC authentication, the resource path for HTTP requests
+
+=== Platform Differences
+
+[cols="1,2,2"]
+|===
+|Aspect |Client (NovaTerm) |Proxy (NTSession)
+
+|MD5 Implementation
+|BouncyCastle `MD5Digest` (CN1 lacks `java.security`)
+|Standard `java.security.MessageDigest`
+
+|BigInteger
+|`javabc.BigInteger` (CN1 port)
+|Standard `java.math.BigInteger`
+|===
+
+=== Error Handling
+
+* *Code 464* -- The BBS only allows one connection per user. If a user is already logged in from another client, the server returns `464` and the client stores this in `NovaServerSession.errorCode`.
+* *Malformed digest* -- If the server's 300 response doesn't contain a valid nonce/realm, a `SessionException` is fired to error listeners.
+
+
+[[client-architecture]]
+== Client Architecture (NovaTerm)
+
+=== Codename One RAD MVC Pattern
+
+NovaTerm uses the Codename One RAD (Rapid Application Development) framework, which provides an Entity-based MVC architecture:
+
+* **Controllers** extend `FormController` -- manage screen lifecycle, handle user actions, load data
+* **Views** extend `AbstractEntityView` -- render UI components bound to entity models
+* **Models** extend `Entity` -- type-safe property containers with change notification
+* **Schemas** are Java interfaces defining `Tag` constants -- map model properties to semantic types (e.g., `Thing.name`, `ChatMessage.author`)
+
+=== Application Entry Point
+
+`NovaTerm.java` is the `ApplicationController` that bootstraps the app:
+
+[source,java]
+----
+// NovaTerm.java
+public class NovaTerm extends ApplicationController {
+    public void init(Object context) {
+        session = new NovaServerSession();
+        session.addPropertyChangeListener(NovaServerSession.connected, evt -> {
+            if (!session.getBoolean(NovaServerSession.connected)) {
+                ToastBar.showInfoMessage("You have been disconnected");
+                new LoginFormController(this).showBack();
+            }
+        });
+        this.addLookup(session);  // Dependency injection via lookup
+    }
+
+    public void start() {
+        new LoginFormController(this).show();  // Start at login
+    }
+
+    public void actionPerformed(ControllerEvent evt) {
+        if (evt.getClass() == WelcomeViewEvent.class) {
+            // Server pushes welcome screen after login
+            new WelcomeWindowController(this, ...).show();
+        }
+    }
+}
+----
+
+Key patterns:
+
+* `NovaServerSession` is registered via `addLookup()` so all child controllers can access it with `lookup(NovaServerSession.class)`
+* Disconnect detection uses a property change listener on the `connected` boolean
+* The `WelcomeViewEvent` is caught at the application level because it's dispatched globally from the WebSocket handler
+
+=== Controller Hierarchy and Navigation
+
+[ditaa]
+----
+  NovaTerm (ApplicationController)
+  |
+  +-- LoginFormController
+  |     |
+  |     | (successful auth sets connected=true)
+  |     | (server pushes REQUEST /welcome.html)
+  |     v
+  +-- WelcomeWindowController
+  |     |
+  |     | ("Main Menu" button -> /Design/17)
+  |     v
+  +-- NTBaseFormController (abstract base for all content controllers)
+        |
+        +-- DesignController .............. /design/*
+        |     Renders image-map menus (NavigateWindow)
+        |     and button-list menus (NovaViewWindow)
+        |
+        +-- MessageForumController ........ /news/*
+        |     |  Lists forum threads
+        |     |
+        |     +-- MessageFormController ... (single message)
+        |     |     Displays message body with
+        |     |     next/prev navigation
+        |     |
+        |     +-- PostMessageController ... (compose/reply)
+        |           Message composition form
+        |
+        +-- LibraryFormController ......... /library/*
+        |     |  Lists files in a library
+        |     |
+        |     +-- LibraryFileDetailController (file details + download)
+        |     |
+        |     +-- FileUploadFormController .. (upload form)
+        |
+        +-- FileFormController ............ /file/*
+        |     Renders file content in BrowserComponent
+        |
+        +-- NewscanController ............. (stub, not implemented)
+----
+
+=== URL-Based Navigation Routing
+
+All navigation flows through `NTBaseFormController.handleNavigationEvent()`, which routes by URL prefix:
+
+[source,java]
+----
+// NTBaseFormController.java, line 61
+public void handleNavigationEvent(NavigationEvent evt) {
+    String dest = evt.getDestinationUrl();
+    String lcDest = dest.toLowerCase();
+
+    if (lcDest.startsWith("/design/") || lcDest.startsWith("http://*/design/"))
+        -> DesignController
+
+    if (lcDest.startsWith("/file/") || lcDest.startsWith("http://*/file/"))
+        -> FileFormController
+
+    if (lcDest.startsWith("/library/") || lcDest.startsWith("http://*/library/"))
+        -> LibraryFormController
+
+    if (lcDest.startsWith("/news/") || lcDest.startsWith("http://*/news/"))
+        -> MessageForumController
+}
+----
+
+The `NavigationEvent` is dispatched by UI elements (image map hotspots, link clicks) and bubbles up the controller hierarchy via `ActionSupport.dispatchEvent()` until a controller consumes it.
+
+=== Event System
+
+[cols="1,2,2"]
+|===
+|Event |Source |Purpose
+
+|`NavigationEvent`
+|Image map clicks, link clicks
+|URL-based routing between controllers
+
+|`RefreshEvent`
+|Post-upload, post-message
+|Triggers controller reload to show new content
+
+|`HoverEvent`
+|Image map hover (desktop)
+|Updates status bar with link target text
+
+|`CommandEvent`
+|WebSocket messages
+|Dispatches raw IRC commands from server
+
+|`WelcomeViewEvent`
+|Server push of `/welcome.html`
+|Triggers welcome screen display
+|===
+
+
+[[features]]
+== Feature Deep-Dives
+
+[[design-screens]]
+=== Design Screens (Interactive Menus)
+
+The BBS main menu and sub-menus are rendered as interactive image maps -- bitmap images with clickable hotspot regions defined by the server.
+
+==== NavigateWindow Template
+
+The server returns HTML containing a `<template name="NavigateWindow">` with:
+
+* A `<fig>` element specifying the background image source, dimensions, and version
+* `<a>` elements defining clickable areas with `href`, `shape`, and `effect` attributes
+
+[source,html]
+----
+<template name="NavigateWindow" size="640;480">
+  <fig src="/file/MainMenu" version="3">
+    <a href="/Design/18" shape="rect 10,20,200,60" effect="highlight">
+    <a href="/news/General/" shape="oval 300,100,100,100">
+  </fig>
+</template>
+----
+
+==== Image Caching
+
+`DesignController` caches design images locally with version tracking:
+
+1. Downloads the image to local storage (e.g., `file/MainMenu`)
+2. Stores the version string in a companion file (e.g., `file/MainMenu.version`)
+3. On subsequent loads, compares the server's version with the cached version
+4. Only re-downloads when the version has changed
+
+==== Rendering
+
+* The design image is scaled to fit the device (portrait: fill width, landscape: fill height)
+* A Gaussian-blurred copy (radius 25) of the image is used as the form background
+* Each `<a>` element becomes a `ClickableArea` in an `ImageMapContainer`
+* Clicking a hotspot fires a `NavigationEvent` with the link's `href`
+* On tablets, the image is centered; on phones, it uses center-fill behavior
+
+==== NovaViewWindow Template
+
+An alternative menu template rendered as a vertical list of labeled buttons with Material Design icons, handled by the `NovaView` class.
+
+[[message-forums]]
+=== Message Forums
+
+==== Browsing Forums
+
+URL pattern: `/news/<Forum Name>/`
+
+The server returns a `ListLibraryWindow` template with a `<part name="List Library Part">` containing an HTML list. Each `<li>` contains `<a>` elements with `<ni>` (nova item) children:
+
+[source,html]
+----
+<li><a href="8.61217740.Golden.Beta">
+  *<ni>subject</ni><ni>author</ni><ni>date</ni><ni>numMessages</ni>
+</a>
+----
+
+`MessageForumController` parses these into `MessageModel` entities displayed in a scrollable list.
+
+==== Reading Messages
+
+Individual messages use the `ReadForumWindow` template:
+
+[source,html]
+----
+<template name="ReadForumWindow">
+<LINK HREF="10.61217740.Golden.Beta" REL="Next">
+<LINK HREF="11.61217740.Golden.Beta" REL="NextThread">
+<LINK HREF="8.61217740.Golden.Beta" REL="Previous">
+<part name="from">Sysop</part>
+<part name="to">Sysop</part>
+<part name="subject">Re: First test message</part>
+<part name="sent at">Sun, 24 May 2020 05:45:48 -0700</part>
+<part name="body"><FONT NAME="Geneva" SIZE=10pt>Message body here</part>
+----
+
+Thread navigation is provided via `<LINK>` elements with `REL` attributes: `Next`, `Previous`, `NextThread`, `PreviousThread`. The `MessageFormController` parses these and provides arrow-button navigation.
+
+==== Posting Messages
+
+`PostMessageController` collects To, Subject, Body, and optional Attachment fields. The message is sent via `NovaServerSession.httpPostMessage()` as a multipart POST with the body encoded in `x-MacRoman`. A `RefreshEvent` is dispatched after posting to refresh the forum list.
+
+[[file-libraries]]
+=== File Libraries
+
+==== Browsing Files
+
+URL pattern: `/library/<Library Name>/`
+
+Uses the same `ListLibraryWindow` template as message forums. Each file entry has `<ni>` children for name, date, size, and download count.
+
+==== File Details
+
+The `DownloadWindow` template provides file metadata:
+
+[source,html]
+----
+<template name="DownloadWindow">
+<part name="Name">NovaTerm</part>
+<part name="from">Sysop</part>
+<part name="size">4060651</part>
+<part name="accessed">0</part>
+<part name="kind">document</part>
+<part name="sent at">Wed, 29 Apr 2020 19:59:12 -0700</part>
+<part name="receive file"><a href="/library/Client Software/1.61183919.Golden.Beta/"></a></part>
+<part name="body"><FONT NAME="Geneva" SIZE=10pt>Description here</part>
+----
+
+==== Downloading Files
+
+The client creates an authenticated URL with the digest auth header embedded as a URL parameter:
+
+[source,java]
+----
+// NovaServerSession.java, line 439
+String url = httpURL + "?uri=" + encodedUrl
+    + "&Authorization=" + encodedDigest
+    + "&Content-Type=application/octet-stream";
+----
+
+This URL is opened in the system browser via `CN.execute()`, which triggers the proxy to strip the multipart wrapper and return only the file attachment.
+
+==== Uploading Files
+
+`FileUploadFormController` collects name, comment, description, and a file attachment. The upload is sent via `NovaServerSession.httpFileUpload()` as a `MultipartRequest` with custom `X-NT-*` and `X-NS-*` headers. The proxy then re-encodes the file in MacBinary II format for the BBS.
+
+[[macbinary]]
+=== MacBinary II Encoding
+
+NovaServer expects uploaded files wrapped in https://code.google.com/archive/p/theunarchiver/wikis/MacBinarySpecs.wiki[MacBinary II format], a legacy Mac file transfer format.
+
+`MacbinaryEncoder` is a `FilterOutputStream` that:
+
+1. Prepends a 128-byte header containing filename, file type (4-char OSType code), creator code, timestamps, and data fork length
+2. Writes the file data (data fork)
+3. Pads the data to 128-byte boundaries
+
+See <<appendix-macbinary>> for the complete header format.
+
+==== File Type Detection
+
+The encoder maps file extensions to classic Mac OS type and creator codes:
+
+[cols="1,1,1,2"]
+|===
+|Extension |Type Code |Creator Code |Application
+
+|`.jpg`
+|`JPEG`
+|`8BIM`
+|Adobe Photoshop
+
+|`.pdf`
+|`PDF `
+|`CARO`
+|Acrobat Reader
+
+|`.gif`
+|`GIFf`
+|`8BIM`
+|Adobe Photoshop
+
+|`.doc`
+|`WDBN`
+|`MSWD`
+|Microsoft Word
+
+|`.html`
+|`TEXT`
+|`sfri`
+|Safari
+
+|`.psd`
+|`8BPS`
+|`8BIM`
+|Adobe Photoshop
+
+|`.txt`
+|`TEXT`
+|`ttxt`
+|SimpleText
+|===
+
+Unknown extensions default to type `????` and creator `????`.
+
+IMPORTANT: The MacBinary CRC-16 field is computed but written as zeros. A comment in the source notes: _"For some reason Novaserver doesn't do the crc"_.
+
+[[welcome-screen]]
+=== Welcome Screen
+
+After successful login:
+
+1. The server pushes `REQUEST /welcome.html` via the WebSocket channel
+2. `NovaServerSession` fetches the welcome page via HTTP
+3. The HTML is parsed to extract the `<part name="body">` content
+4. Embedded images are fetched and converted to data URIs for inline display
+5. The content is rendered in a `BrowserComponent` (native WebView)
+6. A "Main Menu" button navigates to `DesignController` with design ID `17` (the main menu)
+
+
+[[proxy-server]]
+== Proxy Server (NovaserverProxy)
+
+The proxy is a Maven-built Java WAR application that can run standalone via an embedded Tomcat 7 server.
+
+=== WebSocket Endpoint
+
+`NovaserverEndpoint.java` -- Annotated with `@ServerEndpoint("/nova")`.
+
+* Maintains a static `Map<Session, SocketWrapper>` of active connections
+* On `@OnOpen`: creates a `SocketWrapper` targeting NovaServer port 194, calls `bind()` to start the background read thread
+* On `@OnMessage`: delegates to `SocketWrapper.onMessage()` which writes to the TCP socket
+* On `@OnClose`: calls `SocketWrapper.stop()` which closes the TCP socket
+* On `@OnError`: logs the error
+
+==== SocketWrapper Threading Model
+
+Each WebSocket session gets one dedicated background thread:
+
+[source,java]
+----
+// SocketWrapper.java, line 61
+public synchronized void bind() {
+    Thread t = new Thread(() -> {
+        socket = new Socket(host, port);       // Connect to BBS
+        // ... setup input/output streams (UTF-8) ...
+        // Flush any queued messages
+        while (!stop && socket.isConnected()) {
+            String line = input.readLine();     // Block until line
+            session.getBasicRemote().sendText(line); // Send to WebSocket
+        }
+    });
+    t.start();
+}
+----
+
+=== HTTP Proxy Servlet
+
+`NovaserverHTTPProxy.java` -- Mapped to `/proxy` in `web.xml`.
+
+==== GET Request Flow
+
+1. Extract `uri` parameter and `Authorization` header (from header, parameter, or session)
+2. Open raw TCP socket to NovaServer port 80
+3. Send: `GET <uri> HTTP/V1.0\r\n` with auth and `User-Agent: ResNova_NovaTerm_Mac/4.0`
+4. Parse response headers (find `Content-Length`, `Content-Type`, boundary)
+5. Stream response body to client, handling multipart boundaries
+
+==== POST Request Flow (File Upload)
+
+1. Read multipart form parts from client request
+2. Extract custom `x-nt-*` headers (converted to proper case for NovaServer)
+3. Build NovaServer multipart/mixed request with boundary `qphzlgnmbemlrcbkvdgqnkauervssvkg`
+4. For "File" parts: wrap in `MacbinaryEncoder` with `application/macbinary` content type
+5. For "Description" parts: send as `text/html` in `x-MacRoman` encoding
+6. Stream to NovaServer and relay response
+
+==== Download Mode
+
+When the client passes `Content-Type=application/octet-stream` as a URL parameter, the proxy enters download mode:
+
+* Finds the first multipart boundary in the response
+* Strips the boundary headers
+* Adjusts `Content-Length` to exclude boundary overhead
+* Extracts filename from the part's `Content-Type` header and sets `Content-Disposition: attachment`
+* Returns only the raw file content
+
+=== Build and Deployment
+
+[source,bash]
+----
+cd NovaserverProxy
+mvn clean package
+# Produces:
+#   target/NovaserverProxy-1.0-SNAPSHOT.war   (deployable WAR)
+#   novaserver.jar                             (standalone executable)
+
+# Run standalone:
+java -jar novaserver.jar
+# Listens on port 8080 with endpoints /proxy and /nova
+----
+
+The `web.xml` configures:
+
+* Multipart support: max file size 100MB, threshold 10MB
+* Session timeout: 30 minutes
+
+
+[[protocol-reference]]
+== NovaServer Protocol Reference
+
+=== HTML Template Types
+
+NovaServer returns content in a custom HTML dialect. The client dispatches to different controllers based on the `<template name="...">` attribute:
+
+[cols="1,2,2"]
+|===
+|Template Name |Content Type |Client Handler
+
+|`NavigateWindow`
+|Image-map menus with clickable hotspots
+|`DesignController` -> `ImageMapContainer`
+
+|`NovaViewWindow`
+|Button-list menus with labeled icons
+|`DesignController` -> `NovaView`
+
+|`ListLibraryWindow`
+|Lists of files or message threads
+|`LibraryFormController` / `MessageForumController`
+
+|`DownloadWindow`
+|File detail and download link
+|`LibraryFileDetailController`
+
+|`ReadForumWindow`
+|Individual message display
+|`MessageFormController`
+|===
+
+=== Custom HTML Tags
+
+NovaServer's HTML uses several non-standard tags:
+
+[cols="1,3"]
+|===
+|Tag |Purpose
+
+|`<template name="..." size="W;H">`
+|Root template identifier with optional dimensions
+
+|`<part name="...">`
+|Named content block (subject, body, from, etc.)
+
+|`<fig src="..." version="...">`
+|Figure with image source and cache version
+
+|`<ni>`
+|Nova Item -- delimited field within list items
+
+|`<image>`
+|Image reference (distinct from HTML `<img>`)
+
+|`<LINK HREF="..." REL="...">`
+|Navigation metadata (Next, Previous, NextThread, PreviousThread)
+|===
+
+=== HTML Pre-Processing
+
+Before parsing, the client must fix several non-standard patterns:
+
+[source,java]
+----
+// NTBaseFormController.java, line 119-125
+
+// Close unclosed <ni> tags (NovaServer sends <ni>text without closing)
+res = regex("<ni>([^<]*)").subst(res, "<ni>$1</ni>");
+
+// Fix self-closing <template> (parser needs opening + closing)
+res = regex("<template ([^>]+)>").subst(res, "<template $1></template>");
+
+// Rename <image> to prevent HTML parser from converting to <img>
+res = replaceAll(res, "<image ", "<novaterm-image ");
+res = replaceAll(res, "</image>", "</novaterm-image>");
+----
+
+=== The `http://pass:[*]/` URL Convention
+
+Both client and server use `http://pass:[*]/` as a URL prefix where `*` is a literal placeholder for the server hostname. The client prepends this for relative URLs:
+
+[source,java]
+----
+// NovaServerSession.java, line 458
+if (!url.startsWith("http:")) {
+    url = "http://*" + url;
+}
+----
+
+=== Character Encoding
+
+* *WebSocket/IRC protocol*: UTF-8
+* *HTTP POST bodies*: `x-MacRoman` (legacy Mac Roman encoding)
+* *HTTP response parsing*: UTF-8
+* *File upload encoding*: MacBinary II with `x-MacRoman` descriptions
+
+
+[[notable-details]]
+== Notable Technical Details
+
+=== Hardcoded Server Addresses
+
+All server addresses are hardcoded with no configuration mechanism:
+
+[cols="1,2,1"]
+|===
+|File |Constant |Value
+
+|`NovaserverHTTPProxy.java:37-38`
+|`novaserverHost` / `novaserverPort`
+|`10.0.1.117:80`
+
+|`NovaserverEndpoint.java:26-27`
+|`novaserverHost` / `novaserverPort`
+|`10.0.1.117:194`
+
+|`NovaServerSession.java:158`
+|`ircURL`
+|`ws://10.0.1.77:8080/nova`
+
+|`NovaServerSession.java:159`
+|`httpURL`
+|`http://10.0.1.77:8080/proxy`
+|===
+
+NOTE: The proxy host (`10.0.1.77`) and NovaServer host (`10.0.1.117`) are different machines on the same LAN.
+
+=== Connection: maintain
+
+NovaServer uses a non-standard `Connection: maintain` header instead of the standard `Connection: keep-alive`. The proxy sends this to NovaServer and replaces it with `Connection: close` in responses to the client.
+
+=== MacBinary CRC Disabled
+
+The `MacbinaryEncoder` computes a CRC-16 checksum for the header but writes zeros instead. The source comment explains: _"For some reason Novaserver doesn't do the crc."_
+
+=== Responsive Image Maps
+
+`DesignController` dynamically scales image maps based on device orientation:
+
+* *Portrait*: scales to fill available width, maintaining aspect ratio
+* *Landscape*: scales to fill available height, maintaining aspect ratio
+* *Desktop*: uses original dimensions
+* *Tablet vs Phone*: tablets use absolute center, phones use center-fill
+
+=== Line-Ending Normalization
+
+HTTP responses go through a three-step line-ending normalization to handle mixed formats from the BBS:
+
+[source,java]
+----
+// NovaServerSession.java, line 575-577
+str = replaceAll(str, "\r\n", "\r");  // Collapse CRLF to CR
+str = replaceAll(str, "\n", "\r");    // Convert LF to CR
+str = replaceAll(str, "\r", "\r\n");  // Normalize all to CRLF
+----
+
+=== Protocol Reverse-Engineering Artifacts
+
+The repository contains evidence of the reverse-engineering process:
+
+* `novaterm.php` -- A PHP prototype implementing the full NovaServer protocol, including a brute-force digest auth fuzzer. Contains demo credentials `SYSOP`/`flutie` and realm `DemoCentral`.
+* `test4.pcapng` -- A Wireshark packet capture file, likely used to analyze the wire protocol.
+* `templates/` -- PHP templates from the prototype web client.
+
+=== Unimplemented Features
+
+* `NewscanController` -- An empty stub controller, presumably intended for a "new since last visit" scan feature common in BBS systems.
+* `NovatermIRCClient` -- A separate subproject that appears to be an early standalone IRC client prototype, never completed.
+* *Chat/Instant Messaging* -- Despite the IRC-like protocol and `JOIN ServerMessages` command, no chat UI is implemented. The infrastructure exists for real-time messaging via the persistent WebSocket connection.
+
+
+[[build-instructions]]
+== Build Instructions
+
+=== NovaserverProxy (Maven)
+
+[source,bash]
+----
+cd NovaserverProxy
+
+# Build WAR and standalone JAR
+mvn clean package
+
+# Run standalone (embedded Tomcat on port 8080)
+java -jar novaserver.jar
+
+# Or deploy the WAR to an external servlet container
+cp target/NovaserverProxy-1.0-SNAPSHOT.war /path/to/tomcat/webapps/
+----
+
+Requirements: Java 7+, Maven 3.x
+
+=== NovaTerm (Codename One)
+
+[source,bash]
+----
+cd NovaTerm
+
+# Compile (requires Codename One libraries in lib/)
+ant build
+
+# Build for specific platforms (requires Codename One build server)
+ant build-for-ios-device
+----
+
+Requirements: Java 8, Apache Ant, Codename One account (for native builds)
+
+=== Configuration Changes
+
+To point the system at a different NovaServer instance, update these hardcoded values:
+
+[cols="1,2,2"]
+|===
+|File |Lines |Change
+
+|`NovaserverHTTPProxy.java`
+|37-38
+|`novaserverHost` and `novaserverPort` (HTTP)
+
+|`NovaserverEndpoint.java`
+|26-27
+|`novaserverHost` and `novaserverPort` (IRC)
+
+|`NovaServerSession.java`
+|158-159
+|`ircURL` and `httpURL` (proxy address)
+|===
+
+
+[appendix]
+[[appendix-macbinary]]
+== MacBinary II Header Format
+
+The 128-byte MacBinary II header as implemented in `MacbinaryEncoder.java`:
+
+[cols="1,1,3"]
+|===
+|Offset |Size |Description
+
+|0
+|1 byte
+|Version (always 0)
+
+|1
+|1 byte
+|Filename length (1-63)
+
+|2-64
+|63 bytes
+|Filename (padded with `0xF1`)
+
+|65-68
+|4 bytes
+|File type (e.g., `JPEG`, `PDF `, `TEXT`)
+
+|69-72
+|4 bytes
+|Creator code (e.g., `8BIM`, `CARO`, `MSWD`)
+
+|73
+|1 byte
+|Finder flags (Inited=1)
+
+|74
+|1 byte
+|Zero fill
+
+|75-76
+|2 bytes
+|Vertical position (0x0080)
+
+|77-78
+|2 bytes
+|Horizontal position (0x0001)
+
+|79-80
+|2 bytes
+|Window/folder ID (0x0000)
+
+|81
+|1 byte
+|Protected flag
+
+|82
+|1 byte
+|Zero fill
+
+|83-86
+|4 bytes
+|Data fork length (big-endian)
+
+|87-90
+|4 bytes
+|Resource fork length (always 0)
+
+|91-94
+|4 bytes
+|Creation date (milliseconds since epoch)
+
+|95-98
+|4 bytes
+|Last modified date (milliseconds since epoch)
+
+|99-100
+|2 bytes
+|Get Info comment length (0)
+
+|101
+|1 byte
+|Finder flags bits 0-7 (0)
+
+|102-115
+|14 bytes
+|Reserved (zeros)
+
+|116-119
+|4 bytes
+|Unpacked length (0)
+
+|120-121
+|2 bytes
+|Secondary header length (0)
+
+|122
+|1 byte
+|MacBinary version (0)
+
+|123
+|1 byte
+|Minimum MacBinary version (0)
+
+|124-125
+|2 bytes
+|CRC-16 of bytes 0-123 (written as 0x0000)
+
+|126-127
+|2 bytes
+|Padding (zeros)
+|===
+
+After the header, the data fork is written and padded to the next 128-byte boundary.
+
+[appendix]
+[[appendix-type-codes]]
+== File Type and Creator Code Mappings
+
+=== Type Codes (Extension -> OSType)
+
+[cols="1,1,1,1,1,1"]
+|===
+|Extension |Type |Extension |Type |Extension |Type
+
+|`.app` |`APPL` |`.gif` |`GIFf` |`.rtf` |`RTF `
+|`.bmp` |`BMPf` |`.gz`  |`GZIP` |`.sit` |`SIT5`
+|`.cdr` |`CDRW` |`.htm` |`TEXT` |`.sea` |`SIT5`
+|`.css` |`TEXT` |`.html`|`TEXT` |`.tif` |`TIFF`
+|`.dmg` |`devi` |`.jpg` |`JPEG` |`.tga` |`TPIC`
+|`.doc` |`WDBN` |`.pdf` |`PDF ` |`.txt` |`TEXT`
+|`.eps` |`EPSF` |`.psd` |`8BPS` |`.qxd` |`XDOC`
+|===
+
+=== Creator Codes (Extension -> Creator)
+
+[cols="1,1,1,1,1,1"]
+|===
+|Extension |Creator |Extension |Creator |Extension |Creator
+
+|`.ai`  |`ART5` |`.htm` |`sfri` |`.rtf` |`MSWD`
+|`.bmp` |`8BIM` |`.jpg` |`8BIM` |`.sit` |`SITx`
+|`.css` |`sfri` |`.pdf` |`CARO` |`.tif` |`8BIM`
+|`.dmg` |`ddsk` |`.ppt` |`PPT3` |`.xml` |`MSIE`
+|`.doc` |`MSWD` |`.qxd` |`XPR3` |`.zip` |`SITx`
+|`.gif` |`8BIM` |`.html`|`sfri` |`.xsl` |`XCEL`
+|===
+
+[appendix]
+[[appendix-irc-commands]]
+== NovaServer IRC Command Reference
+
+=== Client Commands
+
+[cols="1,3,2"]
+|===
+|Command |Format |When Used
+
+|NONC
+|`NONC :user="USERNAME"`
+|First message after WebSocket connect
+
+|AUTH
+|`AUTH :digest username="U",realm="R",nonce="N",uri="URI",response="HASH"`
+|Response to server's 300 digest challenge
+
+|JOIN
+|`JOIN ServerMessages`
+|After successful authentication
+|===
+
+=== Server Responses
+
+[cols="1,3,2"]
+|===
+|Response |Format |Meaning
+
+|300 (challenge)
+|`300 :digest realm="REALM" nonce="NONCE"`
+|Digest authentication challenge
+
+|300 (success)
+|`300`
+|Authentication successful
+
+|464
+|`464`
+|User already connected from another client
+
+|REQUEST
+|`REQUEST /path/to/resource`
+|Server pushes client to navigate to a URL
+|===
+
+=== Common REQUEST Paths
+
+[cols="1,2"]
+|===
+|Path |Purpose
+
+|`/welcome.html`
+|Welcome screen (first push after login)
+
+|`/Design/17`
+|Main menu (pushed after welcome)
+
+|`/Design/<id>`
+|Sub-menu screens
+
+|`/news/<forum>/`
+|Message forum
+
+|`/library/<name>/`
+|File library
+
+|`/file/<name>`
+|Individual file content
+|===
